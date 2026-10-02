@@ -338,14 +338,16 @@ internal class IssuerCreator(
 }
 
 private fun OpenId4VciManager.SupportedProofTypes.toProofsConfig(): ProofsConfig {
+    val jwtProof = jwtProofAlgorithms?.let { algs ->
+        ProofsConfig.SupportedJwtProof(algs.mapToJWSAlgorithms())
+    }
     return ProofsConfig(
         isNoProofSupported = isNoProofSupported,
-        jwtProof = jwtProofAlgorithms?.let { algs ->
-            ProofsConfig.SupportedJwtProof(algs.mapToJWSAlgorithms())
-        },
+        jwtProofWithKeyAttestation = jwtProof,
         attestationProof = attestationProofAlgorithms?.let { algs ->
             ProofsConfig.SupportedAttestationProof(algs.mapToJWSAlgorithms())
         },
+        jwtProofsWithoutKeyAttestation = jwtProof,
     )
 }
 

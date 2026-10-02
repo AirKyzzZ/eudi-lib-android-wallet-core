@@ -16,17 +16,25 @@
 
 package eu.europa.ec.eudi.wallet.issue.openid4vci
 
+import com.nimbusds.jose.jwk.JWK
 import eu.europa.ec.eudi.openid4vci.AuthorizedRequest
+import eu.europa.ec.eudi.openid4vci.BatchSignOperation
+import eu.europa.ec.eudi.openid4vci.BatchSigner
 import eu.europa.ec.eudi.openid4vci.IssuanceRequestPayload
 import eu.europa.ec.eudi.openid4vci.Issuer
+import eu.europa.ec.eudi.openid4vci.JwtBindingKey
 import eu.europa.ec.eudi.openid4vci.KeyAttestationJWT
 import eu.europa.ec.eudi.openid4vci.ProofSpecification
 import eu.europa.ec.eudi.openid4vci.ProofType
+import eu.europa.ec.eudi.openid4vci.ProofTypeMeta
 import eu.europa.ec.eudi.openid4vci.ProofTypesSupported
+import eu.europa.ec.eudi.openid4vci.SignOperation
 import eu.europa.ec.eudi.openid4vci.SubmissionOutcome
 import eu.europa.ec.eudi.wallet.document.UnsignedDocument
 import eu.europa.ec.eudi.wallet.document.credential.ProofOfPossessionSigner
 import eu.europa.ec.eudi.wallet.provider.WalletKeyAttestationProvider
+import org.multipaz.crypto.Algorithm
+import org.multipaz.securearea.KeyLockedException
 import org.multipaz.securearea.KeyUnlockData
 
 internal class SubmitRequest(
@@ -60,6 +68,7 @@ internal class SubmitRequest(
             IssuanceRequestPayload.ConfigurationBased(offeredDocument.configurationIdentifier)
         val signers = unsignedDocument.getPoPSigners()
         val proofTypesSupported = offeredDocument.configuration.proofTypesSupported
+        val jwtProof = proofTypesSupported[ProofType.JWT] as? ProofTypeMeta.Jwt
 
         val (updatedAuthorizedRequest, outcome) = when {
             // Issuer requires no proof
@@ -73,8 +82,16 @@ internal class SubmitRequest(
                 requestWithAttestationProof(payload, signers)
             }
             // JWT proof with key attestation (if provider available & issuer supports it)
-            proofTypesSupported[ProofType.JWT] != null && walletKeyAttestationProvider != null -> {
+            jwtProof?.keyAttestationRequirement != null && walletKeyAttestationProvider != null -> {
                 authorizedRequest.requestWithJwtProofWithKeyAttestation(
+                    payload, signers, keyUnlockData,
+                    unlockResume = { updatedKeyUnlockData ->
+                        submitRequest(unsignedDocument, offeredDocument, updatedKeyUnlockData)
+                    }
+                )
+            }
+            jwtProof != null && jwtProof.keyAttestationRequirement == null -> {
+                authorizedRequest.requestWithJwtProofsWithoutKeyAttestation(
                     payload, signers, keyUnlockData,
                     unlockResume = { updatedKeyUnlockData ->
                         submitRequest(unsignedDocument, offeredDocument, updatedKeyUnlockData)
@@ -137,7 +154,7 @@ internal class SubmitRequest(
             "WalletKeyAttestationProvider is required for JWT proof with key attestation"
         }
         var proofSigner: KeyAttestationSigner? = null
-        val proofsSpecification = ProofSpecification.JwtProof(
+        val proofsSpecification = ProofSpecification.JwtProofWithKeyAttestation(
             proofSignerProvider = { nonce, _ ->
                 val factory = KeyAttestationSigner.Factory(
                     signers, walletKeyAttestationProvider, keyUnlockData
@@ -169,4 +186,72 @@ internal class SubmitRequest(
 
     }
 
+    private suspend fun AuthorizedRequest.requestWithJwtProofsWithoutKeyAttestation(
+        payload: IssuanceRequestPayload,
+        signers: List<ProofOfPossessionSigner>,
+        keyUnlockData: Map<String, KeyUnlockData?>?,
+        unlockResume: suspend (Map<String, KeyUnlockData?>) -> ResponseResult<SubmissionOutcome>,
+    ): Pair<AuthorizedRequest, SubmissionOutcome> {
+        val proofSigner = JwtProofsSigner(signers, keyUnlockData)
+        val proofsSpecification = ProofSpecification.JwtProofsWithoutKeyAttestation(proofSigner)
+        try {
+            return with(issuer) { request(payload, proofsSpecification) }.getOrThrow()
+        } catch (e: Throwable) {
+            if (proofSigner.keyLockedException == null) throw e
+            throw UserAuthRequiredException(
+                signingAlgorithm = proofSigner.algorithm,
+                keysAndSecureAreas = signers.associate { it.keyAlias to it.secureArea },
+                resume = { keyUnlockData ->
+                    unlockResume(keyUnlockData)
+                },
+                cause = e
+            )
+        }
+    }
+
+}
+
+private class JwtProofsSigner private constructor(
+    private val signers: List<ProofOfPossessionSigner>,
+    val algorithm: Algorithm,
+    private val keyUnlockData: Map<KeyAlias, KeyUnlockData?>?,
+) : BatchSigner<JwtBindingKey> {
+
+    override val javaAlgorithm: String = requireNotNull(algorithm.javaAlgorithm) {
+        "No JCA algorithm name for ${algorithm.name}"
+    }
+
+    var keyLockedException: KeyLockedException? = null
+        private set
+
+    override suspend fun authenticate(): BatchSignOperation<JwtBindingKey> =
+        BatchSignOperation(signers.map { signer ->
+            val signerKeyUnlockData = keyUnlockData?.get(signer.keyAlias)
+            SignOperation(
+                function = { input ->
+                    try {
+                        signer.signPoP(input, signerKeyUnlockData).toDerEncoded()
+                    } catch (e: KeyLockedException) {
+                        keyLockedException = e
+                        throw e
+                    }
+                },
+                publicMaterial = JwtBindingKey.Jwk(
+                    JWK.parse(signer.getKeyInfo().publicKey.toJwk().toString())
+                ),
+            )
+        })
+
+    override suspend fun release(signOps: BatchSignOperation<JwtBindingKey>?) = Unit
+
+    companion object {
+        suspend operator fun invoke(
+            signers: List<ProofOfPossessionSigner>,
+            keyUnlockData: Map<KeyAlias, KeyUnlockData?>?,
+        ): JwtProofsSigner = JwtProofsSigner(
+            signers = signers,
+            algorithm = signers.first().getKeyInfo().algorithm,
+            keyUnlockData = keyUnlockData,
+        )
+    }
 }
